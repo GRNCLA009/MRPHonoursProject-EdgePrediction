@@ -1,0 +1,7 @@
+tensorflow
+numpy
+torch
+stanza
+pathos
+configparser
+delphin
