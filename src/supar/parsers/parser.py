@@ -1,0 +1,312 @@
+# Class OR File
+# Yu Zhang (adapted by Claudia Greenberg)
+# UCT Honours Project: 
+#   Meaning Representation Parsing: 
+#   The Edge Prediction Component of a Semantic Graph Parser
+#   by Claudia Greenberg, GRNCLA009
+# September 2022
+# Parent class to other parsers
+# Used in this adaptation
+# -*- coding: utf-8 -*-
+
+import os
+import shutil
+import tempfile
+from datetime import datetime, timedelta
+import dill
+
+import torch
+import torch.distributed as dist
+from torch.cuda.amp import GradScaler
+from torch.optim import Adam, AdamW
+from torch.optim.lr_scheduler import ExponentialLR
+
+import supar
+from supar.utils import Config, Dataset, Embedding
+from supar.utils.field import Field
+from supar.utils.fn import download, get_rng_state, set_rng_state
+from supar.utils.logging import get_logger, init_logger, progress_bar
+from supar.utils.metric import Metric
+from supar.utils.optim import InverseSquareRootLR, LinearLR
+from supar.utils.parallel import DistributedDataParallel as DDP
+from supar.utils.parallel import gather, is_master, parallel
+
+logger = get_logger(__name__)
+
+class Parser(object):
+
+    NAME = None
+    MODEL = None
+
+    def __init__(self, args, model, transform):
+        self.args = args
+        self.model = model
+        self.transform = transform
+
+    @property
+    def device(self):
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def train(self, train, dev, test, form, buckets=32, workers=0, batch_size=5000, update_steps=1, amp=False, cache=False,
+              clip=5.0, patience=100, **kwargs):
+        epochs = int(self.args.num_epochs)
+        args = self.args.update(locals())
+        init_logger(logger, verbose=args.verbose)
+
+        self.transform.train()
+        batch_size = batch_size // update_steps
+        if dist.is_initialized():
+            batch_size = batch_size // dist.get_world_size()
+        logger.info("Loading the data")
+        train = Dataset(self.transform, args.train, **args).build(batch_size, buckets, True, dist.is_initialized(), workers)
+        dev = Dataset(self.transform, args.dev, **args).build(batch_size, buckets, False, dist.is_initialized(), workers)
+        logger.info(f"{'train:':6} {train}")
+        if not args.test:
+            logger.info(f"{'dev:':6} {dev}\n")
+        else:
+            test = Dataset(self.transform, args.test, **args).build(batch_size, buckets, False, dist.is_initialized(), workers)
+            logger.info(f"{'dev:':6} {dev}")
+            logger.info(f"{'test:':6} {test}\n")
+
+        if args.encoder == 'lstm':
+            self.optimizer = Adam(self.model.parameters(), args.lr, (args.mu, args.nu), args.eps, args.weight_decay)
+            self.scheduler = ExponentialLR(self.optimizer, args.decay**(1/args.decay_steps))
+        elif args.encoder == 'transformer':
+            self.optimizer = Adam(self.model.parameters(), args.lr, (args.mu, args.nu), args.eps, args.weight_decay)
+            self.scheduler = InverseSquareRootLR(self.optimizer, args.warmup_steps)
+        else:
+            steps = len(train.loader) * epochs // args.update_steps
+            self.optimizer = AdamW(
+                [{'params': p, 'lr': args.lr * (1 if n.startswith('encoder') else args.lr_rate)}
+                 for n, p in self.model.named_parameters()],
+                args.lr)
+            self.scheduler = LinearLR(self.optimizer, int(steps*args.warmup), steps)
+        self.scaler = GradScaler(enabled=args.amp)
+
+        if dist.is_initialized():
+            self.model = DDP(self.model,
+                             device_ids=[args.local_rank],
+                             find_unused_parameters=args.get('find_unused_parameters', True))
+            if args.amp:
+                from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
+                self.model.register_comm_hook(dist.group.WORLD, fp16_compress_hook)
+
+        self.epoch, self.best_e, self.patience, self.best_metric, self.elapsed = 1, 1, patience, Metric(), timedelta()
+        if self.args.checkpoint:
+            try:
+                self.optimizer.load_state_dict(self.checkpoint_state_dict.pop('optimizer_state_dict'))
+                self.scheduler.load_state_dict(self.checkpoint_state_dict.pop('scheduler_state_dict'))
+                self.scaler.load_state_dict(self.checkpoint_state_dict.pop('scaler_state_dict'))
+                set_rng_state(self.checkpoint_state_dict.pop('rng_state'))
+                for k, v in self.checkpoint_state_dict.items():
+                    setattr(self, k, v)
+                train.loader.batch_sampler.epoch = self.epoch
+            except AttributeError:
+                logger.warning("No checkpoint found. Try re-launching the traing procedure instead")
+
+        # for each epoch
+        for epoch in range(self.epoch, args.epochs + 1):
+            print("EPOCH: ", epoch) # printing statement
+            start = datetime.now()
+
+            logger.info(f"Epoch {epoch} / {args.epochs}:")
+            self._train(train.loader, train.get_form())
+            metric = self._evaluate(dev.loader, dev.get_form())
+            logger.info(f"{'dev:':5} {metric}")
+            if args.test:
+                logger.info(f"{'test:':5} {self._evaluate(test.loader, test.get_form())}")
+
+            t = datetime.now() - start
+            self.epoch += 1
+            self.patience -= 1
+            self.elapsed += t
+
+            if metric > self.best_metric:
+                self.best_e, self.patience, self.best_metric = epoch, patience, metric
+                if is_master():
+                    self.save_checkpoint(args.path)
+                logger.info(f"{t}s elapsed (saved)\n")
+            else:
+                logger.info(f"{t}s elapsed\n")
+            if self.patience < 1:
+                break
+        if dist.is_initialized():
+            dist.barrier()
+
+        parser = self.load(**args)
+        # only allow the master device to save models
+        if is_master():
+            parser.save(args.path)
+
+        logger.info(f"Epoch {self.best_e} saved")
+        logger.info(f"{'dev:':5} {self.best_metric}")
+        if args.test:
+            logger.info(f"{'test:':5} {parser._evaluate(test.loader, test.get_form())}")
+        logger.info(f"{self.elapsed}s elapsed, {self.elapsed / epoch}s/epoch")
+
+    def evaluate(self, data, buckets=8, workers=0, batch_size=5000, **kwargs):
+        args = self.args.update(locals())
+        init_logger(logger, verbose=args.verbose)
+
+        self.transform.train()
+        logger.info("Loading the data")
+        dataset = Dataset(self.transform, **args)
+        dataset.build(batch_size, buckets, False, dist.is_initialized(), workers)
+        logger.info(f"\n{dataset}")
+
+        logger.info("Evaluating the dataset")
+        start = datetime.now()
+        metric = self._evaluate(dataset.loader, dataset.get_form())
+        elapsed = datetime.now() - start
+        logger.info(f"{metric}")
+        logger.info(f"{elapsed}s elapsed, {len(dataset)/elapsed.total_seconds():.2f} Sents/s")
+
+        return metric
+
+    def predict(self, data, pred=None, original_form=None, lang=None, buckets=8, workers=0, batch_size=5000, prob=False, cache=False, **kwargs):
+        args = self.args.update(locals())
+                        
+        if original_form is not None and original_form != args.form: # update sometimes loses form value
+            args.form = original_form
+       
+        init_logger(logger, verbose=args.verbose)
+
+        self.transform.eval()
+        if args.prob:
+            self.transform.append(Field('probs'))
+
+        logger.info("Loading the data")
+        
+        dataset = Dataset(self.transform, **args)
+        dataset.build(batch_size, buckets, False, dist.is_initialized(), workers)
+        
+        logger.info(f"\n{dataset}")
+
+        logger.info("Making predictions on the dataset")
+        start = datetime.now()
+        with tempfile.TemporaryDirectory() as t, parallel(False, None):
+            print(dataset.get_form()) # printing statement
+            # we have clustered the sentences by length here to speed up prediction,
+            # so the order of the yielded sentences can't be guaranteed
+            for s in self._predict(dataset.loader, dataset.get_form()):
+                if args.cache:
+                    with open(os.path.join(t, f"{s.index}"), 'w') as f:
+                        f.write(str(s) + '\n')
+            elapsed = datetime.now() - start
+
+            if dist.is_initialized():
+                dist.barrier()
+            if args.cache:
+                tdirs = gather(t) if dist.is_initialized() else (t,)
+            if pred is not None and is_master():
+                logger.info(f"Saving predicted results to {pred}")
+                with open(pred, 'w') as f:
+                    # merge all predictions into one single file
+                    if args.cache:
+                        sentences = (os.path.join(i, s) for i in tdirs for s in os.listdir(i))
+                        for i in progress_bar(sorted(sentences, key=lambda x: int(os.path.basename(x)))):
+                            with open(i) as s:
+                                shutil.copyfileobj(s, f)
+                    else:
+                        for s in progress_bar(dataset):
+                            f.write(str(s) + '\n')
+            # exit util all files have been merged
+            if dist.is_initialized():
+                dist.barrier()
+        logger.info(f"{elapsed}s elapsed, {len(dataset) / elapsed.total_seconds():.2f} Sents/s")
+
+        if not cache:
+            return dataset
+
+    @parallel()
+    def _train(self, loader):
+        raise NotImplementedError
+
+    @parallel(training=False)
+    def _evaluate(self, loader):
+        raise NotImplementedError
+
+    @parallel(training=False, op=None)
+    def _predict(self, loader):
+        raise NotImplementedError
+
+    @classmethod
+    def build(cls, path, **kwargs):
+        raise NotImplementedError
+
+    @classmethod
+    def load(cls, path, reload=False, src='github', checkpoint=False, **kwargs):
+        r"""
+        Loads a parser with data fields and pretrained model parameters.
+
+        Args:
+            path (str):
+                - a string with the shortcut name of a pretrained model defined in ``supar.MODEL``
+                  to load from cache or download, e.g., ``'biaffine-dep-en'``.
+                - a local path to a pretrained model, e.g., ``./<path>/model``.
+            reload (bool):
+                Whether to discard the existing cache and force a fresh download. Default: ``False``.
+            src (str):
+                Specifies where to download the model.
+                ``'github'``: github release page.
+                ``'hlt'``: hlt homepage, only accessible from 9:00 to 18:00 (UTC+8).
+                Default: ``'github'``.
+            checkpoint (bool):
+                If ``True``, loads all checkpoint states to restore the training process. Default: ``False``.
+            kwargs (Dict):
+                A dict holding unconsumed arguments for updating training configs and initializing the model.
+
+        Examples:
+            >>> from supar import Parser
+            >>> parser = Parser.load('biaffine-dep-en')
+            >>> parser = Parser.load('./ptb.biaffine.dep.lstm.char')
+        """
+
+        args = Config(**locals())
+        if not os.path.exists(path):
+            path = download(supar.MODEL[src].get(path, path), reload=reload)
+        state = torch.load(path, map_location='cpu')
+        cls = supar.PARSER[state['name']] if cls.NAME is None else cls
+        args = state['args'].update(args)
+        model = cls.MODEL(**args)
+        model.load_pretrained(state['pretrained'])
+        model.load_state_dict(state['state_dict'], False)
+        transform = state['transform']
+        parser = cls(args, model, transform)
+        parser.checkpoint_state_dict = state.get('checkpoint_state_dict', None) if checkpoint else None
+        parser.model.to(parser.device)
+        return parser
+
+    def save(self, path):
+        model = self.model
+        if hasattr(model, 'module'):
+            model = self.model.module
+        args = model.args
+        state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+        pretrained = state_dict.pop('pretrained.weight', None)
+        state = {'name': self.NAME,
+                 'args': args,
+                 'state_dict': state_dict,
+                 'pretrained': pretrained,
+                 'transform': self.transform}
+        torch.save(state, path, pickle_module=dill)
+
+    def save_checkpoint(self, path):
+        model = self.model
+        if hasattr(model, 'module'):
+            model = self.model.module
+        args = model.args
+        checkpoint_state_dict = {k: getattr(self, k) for k in ['epoch', 'best_e', 'patience', 'best_metric', 'elapsed']}
+        checkpoint_state_dict.update({'optimizer_state_dict': self.optimizer.state_dict(),
+                                      'scheduler_state_dict': self.scheduler.state_dict(),
+                                      'scaler_state_dict': self.scaler.state_dict(),
+                                      'rng_state': get_rng_state()})
+        state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
+        pretrained = state_dict.pop('pretrained.weight', None)
+        state = {'name': self.NAME,
+                 'args': args,
+                 'state_dict': state_dict,
+                 'pretrained': pretrained,
+                 'checkpoint_state_dict': checkpoint_state_dict,
+                 'transform': self.transform}
+        torch.save(state, path, pickle_module=dill)
